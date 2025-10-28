@@ -70,7 +70,7 @@ object CFSummaryReport extends IJob with BaseReportsJob with UserCacheSupport {
     implicit val frameworkContext: FrameworkContext = getReportingFrameworkContext()
     init()
     try {
-      val res = CommonUtil.time(prepareReport(spark, fetchData))
+      val res = CommonUtil.time(prepareReport(fetchData))
       val reportData = res._2
       saveToPostgres(reportData)
       reportData.unpersist()
@@ -91,64 +91,31 @@ object CFSummaryReport extends IJob with BaseReportsJob with UserCacheSupport {
   }
 
   // $COVERAGE-ON$
-  def getUserEnrollment(spark: SparkSession, fetchData: (SparkSession, Map[String, String], String, StructType) => DataFrame): DataFrame = {
+  def getUserEnrollment(fetchData: (SparkSession, Map[String, String], String, StructType) => DataFrame)(implicit spark: SparkSession): DataFrame = {
     val cols = getUserEnrolromentColumns()
-    val rawDF = fetchData(spark, userEnrolmentDBSettings, cassandraUrl, new StructType())
+    val df = fetchData(spark, userEnrolmentDBSettings, cassandraUrl, new StructType())
       .filter(lower(col("active")).equalTo("true"))
-
-    val df = if (rawDF.columns.contains("enrolleddate")) {
-      rawDF.withColumn("enrolleddate", UDFUtils.getLatestValue(col("enrolled_date"), col("enrolleddate")))
-    } else {
-      rawDF.withColumn("enrolleddate", col("enrolled_date"))
-    }
+      .withColumn("enrolleddate", col("enrolled_date"))
 
     df.select(cols.head, cols.tail: _*)
       .repartition(AppConf.getConfig("exhaust.user.parallelism").toInt, col("userid"))
   }
 
-  def getCourseBatchDF(spark: SparkSession, fetchData: (SparkSession, Map[String, String], String, StructType) => DataFrame): DataFrame = {
+  def getCourseBatchDF(fetchData: (SparkSession, Map[String, String], String, StructType) => DataFrame)(implicit spark: SparkSession): DataFrame = {
     fetchData(spark, collectionBatchDBSettings, cassandraUrl, new StructType())
       .select("activityid", "batchid", "name", "start_date", "end_date")
   }
 
 
-  def prepareReport(spark: SparkSession, fetchData: (SparkSession, Map[String, String], String, StructType) => DataFrame)(implicit fc: FrameworkContext, config: JobConfig): DataFrame = {
-    implicit val sparkSession: SparkSession = spark
+  def prepareReport(fetchData: (SparkSession, Map[String, String], String, StructType) => DataFrame)(implicit spark: SparkSession, fc: FrameworkContext, config: JobConfig): DataFrame = {
     import spark.implicits._
 
-    val userEnrolmentDF = getUserEnrollment(spark, fetchData)
-    val userCachedDF = getUserCacheDF(spark, fetchData)
-    val courseBatchDF = getCourseBatchDF(spark, fetchData)
-
-    println("[DEBUG] ===== STEP 1: Get User Enrollments =====")
-    println(s"[DEBUG] User enrollments count: ${userEnrolmentDF.count()}")
-    userEnrolmentDF.show(5, false)
-
-    // Debug: Check activity types in enrollments
-    println("[DEBUG] Activity types in enrollments:")
-    userEnrolmentDF.groupBy("activitytype").count().show(false)
-    println("[DEBUG] Sample CL enrollments:")
-    userEnrolmentDF.filter(lower(col("activitytype")).contains("competency level") ||
-        lower(col("activitytype")).contains("competencylevel"))
-      .show(5, false)
-
-    // Clean user enrolments and course batch
-    val cleanUserEnrolmentDF = userEnrolmentDF.filter(
-      col("activityid").isNotNull &&
-        col("batchid").isNotNull &&
-        col("activityid") =!= "" &&
-        col("batchid") =!= ""
-    )
-
-    val cleanCourseBatchDF = courseBatchDF.filter(
-      col("activityid").isNotNull &&
-        col("batchid").isNotNull &&
-        col("activityid") =!= "" &&
-        col("batchid") =!= ""
-    )
+    val userEnrolmentDF = getUserEnrollment(fetchData)
+    val userCachedDF = getUserCacheDF(fetchData)
+    val courseBatchDF = getCourseBatchDF(fetchData)
 
     // Join enrolments with course batch (to get start & end dates and batch name)
-    val userJoinedWithBatchDF = cleanUserEnrolmentDF.join(cleanCourseBatchDF, Seq("activityid", "batchid"), "left")
+    val userJoinedWithBatchDF = userEnrolmentDF.join(courseBatchDF, Seq("activityid", "batchid"), "left")
 
     // Register UDFs properly
     val convertDateUDF = udf(convertDateFn)
